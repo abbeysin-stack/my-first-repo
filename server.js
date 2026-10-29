@@ -5,7 +5,7 @@ import {randomBytes,scryptSync,timingSafeEqual,createHash} from 'node:crypto';
 import {resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {createMicrosoftAuth} from './microsoft.js';
-import {validateRecord,divisionForGrade} from './src/students.js';
+import {validateRecord,divisionForGrade,validateRosterStudent} from './src/students.js';
 import {validateTotals} from './src/entry.js';
 const hash=value=>createHash('sha256').update(value).digest('hex');
 const passwordHash=(password,salt)=>scryptSync(password,salt,64).toString('hex');
@@ -19,10 +19,13 @@ export async function createApp({dbPath=process.env.ATTENDANCE_DB_PATH||resolve(
     CREATE TABLE IF NOT EXISTS attendance(date TEXT NOT NULL,student_code TEXT NOT NULL,grade TEXT NOT NULL,division TEXT NOT NULL,status TEXT NOT NULL,updated_by INTEGER NOT NULL REFERENCES users(id),updated_at TEXT NOT NULL,PRIMARY KEY(date,student_code));
     CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,actor INTEGER REFERENCES users(id),action TEXT NOT NULL,record_count INTEGER NOT NULL,created_at TEXT NOT NULL);`);
   if(!db.prepare('PRAGMA table_info(attendance)').all().some(c=>c.name==='reason'))db.exec("ALTER TABLE attendance ADD COLUMN reason TEXT NOT NULL DEFAULT ''");
+  if(!db.prepare('PRAGMA table_info(attendance)').all().some(c=>c.name==='note'))db.exec("ALTER TABLE attendance ADD COLUMN note TEXT NOT NULL DEFAULT ''");
   db.exec("UPDATE attendance SET reason='unexplained' WHERE status='absent' AND reason=''");
   db.exec(`CREATE TABLE IF NOT EXISTS roster(student_code TEXT PRIMARY KEY,grade TEXT NOT NULL,updated_by INTEGER REFERENCES users(id),updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS grade_totals(date TEXT NOT NULL,grade TEXT NOT NULL,total INTEGER NOT NULL,present INTEGER NOT NULL,absent INTEGER NOT NULL,leave INTEGER NOT NULL,late INTEGER NOT NULL,updated_by INTEGER NOT NULL REFERENCES users(id),updated_at TEXT NOT NULL,PRIMARY KEY(date,grade));
     INSERT OR IGNORE INTO roster(student_code,grade,updated_at) SELECT a.student_code,a.grade,a.updated_at FROM attendance a WHERE a.date=(SELECT MAX(b.date) FROM attendance b WHERE b.student_code=a.student_code);`);
+  for(const column of ['display_name','registration_number'])if(!db.prepare('PRAGMA table_info(roster)').all().some(c=>c.name===column))db.exec(`ALTER TABLE roster ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS roster_registration_unique ON roster(registration_number COLLATE NOCASE) WHERE registration_number<>''");
   if(dbPath!==':memory:')await chmod(dbPath,0o600);
   const microsoft=createMicrosoftAuth(microsoftConfig||{tenantId:process.env.MS_TENANT_ID,clientId:process.env.MS_CLIENT_ID,clientSecret:process.env.MS_CLIENT_SECRET,origin:appOrigin},fetchImpl);
   const localAuth=allowSetup&&!microsoft.configured;
@@ -90,14 +93,14 @@ export async function createApp({dbPath=process.env.ATTENDANCE_DB_PATH||resolve(
       }
       const user=getUser();if(!user)return send(401,{error:'Sign in to access attendance.'});
       if(path==='/api/logout'&&req.method==='POST'){const token=getToken();if(token)db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hash(token));return send(200,{ok:true},{'Set-Cookie':`attendance_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${production?'; Secure':''}`});}
-      if(path==='/api/records'&&req.method==='GET'){audit(user.id,'records_read');return send(200,{records:db.prepare('SELECT date,student_code,grade,division,status,reason FROM attendance ORDER BY date,student_code').all().map(({reason,...r})=>({...r,...(reason?{reason}:{})})),totals:db.prepare('SELECT date,grade,total,present,absent,leave,late FROM grade_totals ORDER BY date,grade').all(),roster:db.prepare('SELECT student_code,grade FROM roster ORDER BY grade,student_code').all()});}
+      if(path==='/api/records'&&req.method==='GET'){audit(user.id,'records_read');return send(200,{records:db.prepare('SELECT date,student_code,grade,division,status,reason,note FROM attendance ORDER BY date,student_code').all().map(({reason,note,...r})=>({...r,...(reason?{reason}:{}),...(note?{note}:{})})),totals:db.prepare('SELECT date,grade,total,present,absent,leave,late FROM grade_totals ORDER BY date,grade').all(),roster:db.prepare('SELECT student_code,grade,display_name,registration_number FROM roster ORDER BY grade,student_code').all()});}
       if(path==='/api/records'&&req.method==='POST'){
         if(!Array.isArray(body.records)||!body.records.length||body.records.length>30000)return send(400,{error:'Supply between 1 and 30,000 student records.'});
-        let records;try{records=body.records.map(r=>{if(!r||typeof r!=='object'||Object.keys(r).some(k=>!['date','student_code','grade','division','status','reason'].includes(k)))throw Error('Only coded attendance fields may be saved.');const clean=validateRecord(r);if(clean.division!==divisionForGrade(clean.grade))throw Error('Division must match the student’s grade.');return clean;});}catch(e){return send(400,{error:e.message});}
+        let records;try{records=body.records.map(r=>{if(!r||typeof r!=='object'||Object.keys(r).some(k=>!['date','student_code','grade','division','status','reason','note'].includes(k)))throw Error('Only coded attendance fields may be saved.');const clean=validateRecord(r);if(clean.division!==divisionForGrade(clean.grade))throw Error('Division must match the student’s grade.');return clean;});}catch(e){return send(400,{error:e.message});}
         for(const r of records)if(db.prepare('SELECT 1 FROM grade_totals WHERE date=? AND grade=?').get(r.date,r.grade))return send(409,{error:'This grade uses count entry for that date. Clear its saved counts before marking individual students.'});
         const seen=new Set();for(const r of records){const key=r.date+'|'+r.student_code;if(seen.has(key))return send(400,{error:'Duplicate student/date entries are not permitted.'});seen.add(key);}
-        const insert=db.prepare('INSERT INTO attendance(date,student_code,grade,division,status,updated_by,updated_at,reason) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(date,student_code) DO UPDATE SET grade=excluded.grade,division=excluded.division,status=excluded.status,updated_by=excluded.updated_by,updated_at=excluded.updated_at,reason=excluded.reason');
-        db.exec('BEGIN IMMEDIATE');try{for(const r of records){insert.run(r.date,r.student_code,r.grade,r.division,r.status,user.id,new Date().toISOString(),r.reason||'');db.prepare('INSERT INTO roster(student_code,grade,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(student_code) DO UPDATE SET grade=excluded.grade,updated_by=excluded.updated_by,updated_at=excluded.updated_at WHERE ? >= (SELECT MAX(date) FROM attendance WHERE student_code=excluded.student_code)').run(r.student_code,r.grade,user.id,new Date().toISOString(),r.date);}audit(user.id,'records_saved',records.length);db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}
+        const insert=db.prepare('INSERT INTO attendance(date,student_code,grade,division,status,updated_by,updated_at,reason,note) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(date,student_code) DO UPDATE SET grade=excluded.grade,division=excluded.division,status=excluded.status,updated_by=excluded.updated_by,updated_at=excluded.updated_at,reason=excluded.reason,note=excluded.note');
+        db.exec('BEGIN IMMEDIATE');try{for(const r of records){insert.run(r.date,r.student_code,r.grade,r.division,r.status,user.id,new Date().toISOString(),r.reason||'',r.note||'');db.prepare('INSERT INTO roster(student_code,grade,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(student_code) DO UPDATE SET grade=excluded.grade,updated_by=excluded.updated_by,updated_at=excluded.updated_at WHERE ? >= (SELECT MAX(date) FROM attendance WHERE student_code=excluded.student_code)').run(r.student_code,r.grade,user.id,new Date().toISOString(),r.date);}audit(user.id,'records_saved',records.length);db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}
         return send(200,{saved:records.length});
       }
       if(path==='/api/records'&&req.method==='DELETE'){
@@ -106,10 +109,20 @@ export async function createApp({dbPath=process.env.ATTENDANCE_DB_PATH||resolve(
       }
       if(path==='/api/roster'&&req.method==='POST'){
         if(!Array.isArray(body.students)||!body.students.length||body.students.length>10000)return send(400,{error:'Supply 1–10,000 coded roster students.'});
-        let students;try{students=body.students.map(r=>{if(!r||Object.keys(r).sort().join(',')!=='grade,student_code')throw Error('Roster accepts only student codes and grades.');validateRecord({date:'2026-01-01',student_code:r.student_code,grade:r.grade,division:divisionForGrade(r.grade),status:'present'});return r;});}catch(e){return send(400,{error:e.message});}
-        const seen=new Set();for(const r of students){if(seen.has(r.student_code))return send(400,{error:'Duplicate student codes in roster.'});seen.add(r.student_code);}
-        const statement=db.prepare('INSERT INTO roster(student_code,grade,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(student_code) DO UPDATE SET grade=excluded.grade,updated_by=excluded.updated_by,updated_at=excluded.updated_at');
-        db.exec('BEGIN IMMEDIATE');try{for(const r of students)statement.run(r.student_code,r.grade,user.id,new Date().toISOString());audit(user.id,'roster_saved',students.length);db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}return send(200,{saved:students.length});
+        let students;try{students=body.students.map(r=>{if(!r||Object.keys(r).some(k=>!['student_code','grade','display_name','registration_number'].includes(k)))throw Error('Roster accepts only a display name, registration number, grade, and optional internal code.');return validateRosterStudent(r);});}catch(e){return send(400,{error:e.message});}
+        const seenCodes=new Set(),seenRegistrations=new Set();
+        for(const r of students){
+          const registration=r.registration_number?.toUpperCase();
+          if((r.student_code&&seenCodes.has(r.student_code))||(registration&&seenRegistrations.has(registration)))return send(400,{error:'Duplicate student codes or registration numbers in roster.'});
+          const existingRegistration=registration?db.prepare('SELECT student_code FROM roster WHERE registration_number=? COLLATE NOCASE').get(r.registration_number):null;
+          const existingCode=r.student_code?db.prepare('SELECT registration_number FROM roster WHERE student_code=?').get(r.student_code):null;
+          if(existingRegistration&&r.student_code&&existingCode&&existingRegistration.student_code!==r.student_code)return send(409,{error:'That registration number and internal code belong to different roster entries.'});
+          if(existingCode?.registration_number&&registration&&existingCode.registration_number.toUpperCase()!==registration)return send(409,{error:'An internal code is already linked to a different registration number.'});
+          r.student_code=existingRegistration?.student_code||r.student_code||'S-'+randomBytes(8).toString('hex').toUpperCase();
+          if(seenCodes.has(r.student_code))return send(400,{error:'Duplicate students in roster.'});seenCodes.add(r.student_code);if(registration)seenRegistrations.add(registration);
+        }
+        const statement=db.prepare("INSERT INTO roster(student_code,grade,updated_by,updated_at,display_name,registration_number) VALUES(?,?,?,?,?,?) ON CONFLICT(student_code) DO UPDATE SET grade=excluded.grade,updated_by=excluded.updated_by,updated_at=excluded.updated_at,display_name=CASE WHEN excluded.display_name<>'' THEN excluded.display_name ELSE roster.display_name END,registration_number=CASE WHEN excluded.registration_number<>'' THEN excluded.registration_number ELSE roster.registration_number END");
+        db.exec('BEGIN IMMEDIATE');try{for(const r of students)statement.run(r.student_code,r.grade,user.id,new Date().toISOString(),r.display_name||'',r.registration_number||'');audit(user.id,'roster_saved',students.length);db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}return send(200,{saved:students.length});
       }
       if(path==='/api/totals'&&req.method==='POST'){
         let t;try{if(Object.keys(body).some(k=>!['date','grade','total','absent','leave','late'].includes(k)))throw Error('Only grade attendance counts may be saved.');t=validateTotals(body);}catch(e){return send(400,{error:e.message});}

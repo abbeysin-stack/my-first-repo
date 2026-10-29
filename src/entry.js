@@ -21,5 +21,5 @@ export function rosterForGrade(roster,records,grade,date){
   // Include recorded students even if a current roster was not imported yet.
   for(const r of records.filter(r=>r.grade===grade&&r.date===date))if(!map.has(r.student_code))map.set(r.student_code,{student_code:r.student_code,grade});
   const today=new Map(records.filter(r=>r.date===date).map(r=>[r.student_code,r]));
-  return [...map.values()].sort((a,b)=>a.student_code.localeCompare(b.student_code)).map(s=>({...s,record:today.get(s.student_code)?.grade===grade?today.get(s.student_code):undefined}));
+  return [...map.values()].sort((a,b)=>(a.display_name||a.student_code).localeCompare(b.display_name||b.student_code)||(a.registration_number||'').localeCompare(b.registration_number||'')).map(s=>({...s,record:today.get(s.student_code)?.grade===grade?today.get(s.student_code):undefined}));
 }

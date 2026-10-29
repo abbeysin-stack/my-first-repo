@@ -1,6 +1,6 @@
 # Attend — school attendance
 
-Grade-level student attendance, coded absence histories, and leadership email drafts for Junior School (PYP), Junior School (MYP), Secondary (IGCSE), and Secondary (IB DP).
+Grade-level student attendance, staff-only student absence histories, and leadership email drafts for Junior School (PYP), Junior School (MYP), Secondary (IGCSE), and Secondary (IB DP).
 
 ## Try the fictional demo in GitHub Codespaces
 
@@ -27,7 +27,7 @@ The demo needs no Microsoft registration. Its fictional records stay in browser 
 
 Microsoft school sign-in requires an Entra app registration, assigned staff roles, secure configuration, and an HTTPS deployment. It is implemented but has not been validated against a real school tenant. Without configuration, real attendance access remains locked.
 
-Student histories use pseudonymous codes, not full anonymization. Raw CSV files stay in the browser; extra personal fields are discarded before coded records reach the server. Shared attendance is stored in SQLite, with CSV import/export. Excel files must first be exported to CSV.
+The authenticated staff register stores first name + last initial, registration number, and written absence notes. These are personal data, not anonymous records. Leadership drafts contain aggregates only. Coded CSV exports exclude display names, registration numbers, and written notes, but remain sensitive pseudonymous data. Roster imports keep the requested identity fields and discard unrecognized columns before saving. Shared attendance is stored in SQLite, with CSV import/export. Excel files must first be exported to CSV.
 
 See [SETUP.md](SETUP.md) for Microsoft setup, grade mappings, privacy boundaries, storage, and production requirements. GitHub Pages cannot run the application server.
 
@@ -36,6 +36,6 @@ See [SETUP.md](SETUP.md) for Microsoft setup, grade mappings, privacy boundaries
 For each grade and date, secretaries choose one method:
 
 - **Counts:** enter student count, absent, on leave, and late. Present is calculated. Counts feed division reporting without creating individual student histories.
-- **Individual register:** add coded students or import a roster with `student_code,grade`, then click a status beside each student. Marking absent opens a description selector: illness, appointment, family reason, authorized absence, or unexplained. `Mark unrecorded students present` requires confirmation and preserves existing absences.
+- **Individual register:** enter first name + last initial (for example, `Ava R.`) and a registration number (for example, `000123`), or import `display_name,registration_number,grade`. Internal codes are generated automatically and registration numbers retain leading zeros. The roster shows the name and registration in separate columns. Click a status beside each student. Marking absent opens a description selector (illness, appointment, family reason, authorized absence, or unexplained), plus an optional written staff note of up to 1,000 characters. Notes appear in the staff register and absence history, not leadership drafts or coded exports. `Mark unrecorded students present` requires confirmation and preserves existing absences.
 
-The app prevents counts and individual attendance from being saved for the same grade/date. Clear saved counts before switching to individual marking. If individual records already exist, continue using that register. Existing student attendance imports also populate the roster. Counts have a separate CSV export; coded attendance CSVs include the optional allowlisted `reason` column. Free-text personal or medical notes are not accepted.
+The app prevents counts and individual attendance from being saved for the same grade/date. Clear saved counts before switching to individual marking. If individual records already exist, continue using that register. Existing student attendance imports also populate the roster. Counts have a separate CSV export; coded attendance CSVs include the optional allowlisted `reason` column. Written notes are stored as entered; the app does not automatically scrub them for personal data. Include only necessary attendance context. Legacy coded rosters remain supported; an optional `student_code` column links identities to existing history. Updating the same registration number updates the roster entry without creating a second student.

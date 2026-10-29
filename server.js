@@ -1,0 +1,121 @@
+import http from 'node:http';
+import {readFile,mkdir,chmod} from 'node:fs/promises';
+import {DatabaseSync} from 'node:sqlite';
+import {randomBytes,scryptSync,timingSafeEqual,createHash} from 'node:crypto';
+import {resolve} from 'node:path';
+import {pathToFileURL} from 'node:url';
+import {createMicrosoftAuth} from './microsoft.js';
+import {validateRecord,divisionForGrade} from './src/students.js';
+const hash=value=>createHash('sha256').update(value).digest('hex');
+const passwordHash=(password,salt)=>scryptSync(password,salt,64).toString('hex');
+const routes={'/':'index.html','/src/app.js':'src/app.js','/src/core.js':'src/core.js','/src/students.js':'src/students.js','/src/style.css':'src/style.css'};
+export async function createApp({dbPath=process.env.ATTENDANCE_DB_PATH||resolve('.local/attendance.sqlite'),production=process.env.NODE_ENV==='production',appOrigin=process.env.APP_ORIGIN,allowSetup=process.env.ATTENDANCE_LOCAL_AUTH==='1',microsoftConfig,fetchImpl}={}){
+  if(production && (!appOrigin || !appOrigin.startsWith('https://')))throw Error('Production requires an HTTPS APP_ORIGIN and a trusted TLS reverse proxy.');
+  if(dbPath!==':memory:'){await mkdir(resolve(dbPath,'..'),{recursive:true,mode:0o700});}
+  const db=new DatabaseSync(dbPath);db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
+    CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,username TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,salt TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('admin','staff')),created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,expires INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS attendance(date TEXT NOT NULL,student_code TEXT NOT NULL,grade TEXT NOT NULL,division TEXT NOT NULL,status TEXT NOT NULL,updated_by INTEGER NOT NULL REFERENCES users(id),updated_at TEXT NOT NULL,PRIMARY KEY(date,student_code));
+    CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,actor INTEGER REFERENCES users(id),action TEXT NOT NULL,record_count INTEGER NOT NULL,created_at TEXT NOT NULL);`);
+  if(dbPath!==':memory:')await chmod(dbPath,0o600);
+  const microsoft=createMicrosoftAuth(microsoftConfig||{tenantId:process.env.MS_TENANT_ID,clientId:process.env.MS_CLIENT_ID,clientSecret:process.env.MS_CLIENT_SECRET,origin:appOrigin},fetchImpl);
+  const localAuth=allowSetup&&!microsoft.configured;
+  const attempts=new Map();let setupConsumed=false;
+  const headers={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','X-Frame-Options':'DENY','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"};
+  if(production)headers['Strict-Transport-Security']='max-age=31536000';
+  const audit=(actor,action,count=0)=>db.prepare('INSERT INTO audit(actor,action,record_count,created_at) VALUES(?,?,?,?)').run(actor,action,count,new Date().toISOString());
+  const server=http.createServer(async(req,res)=>{
+    const send=(status,data,extra={})=>{res.writeHead(status,{...headers,'Content-Type':'application/json',...extra});res.end(JSON.stringify(data));};
+    try{
+      const url=new URL(req.url,'http://localhost');const path=url.pathname;
+      if(path==='/auth/microsoft'&&req.method==='GET'){
+        if(!microsoft.configured)return send(503,{error:'Microsoft sign-in is not configured. Ask your school administrator to complete deployment settings.'});
+        const start=microsoft.begin();res.writeHead(302,{...headers,'Location':start.url,'Set-Cookie':`attendance_oauth=${start.binding}; HttpOnly; SameSite=Lax; Path=/auth/; Max-Age=600${production?'; Secure':''}`});return res.end();
+      }
+      if(path==='/auth/microsoft/callback'&&req.method==='GET'){
+        try{
+          const binding=req.headers.cookie?.split(';').map(s=>s.trim()).find(s=>s.startsWith('attendance_oauth='))?.slice('attendance_oauth='.length);
+          const identity=await microsoft.complete(url.searchParams,binding);
+          const username='ms-'+identity.oid;let user=db.prepare('SELECT * FROM users WHERE username=?').get(username);
+          if(!user){const salt=randomBytes(24).toString('hex');const result=db.prepare('INSERT INTO users(username,password_hash,salt,role,created_at) VALUES(?,?,?,?,?)').run(username,passwordHash(randomBytes(32).toString('hex'),salt),salt,identity.role,new Date().toISOString());user={id:Number(result.lastInsertRowid),username,role:identity.role};}else{db.prepare('UPDATE users SET role=? WHERE id=?').run(identity.role,user.id);user.role=identity.role;}
+          const token=randomBytes(32).toString('hex');db.prepare('DELETE FROM sessions WHERE expires<?').run(Date.now());db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(hash(token),user.id,Date.now()+8*3600000);audit(user.id,'microsoft_login');
+          res.writeHead(302,{...headers,'Location':'/','Set-Cookie':[`attendance_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${production?'; Secure':''}`,`attendance_oauth=; HttpOnly; SameSite=Lax; Path=/auth/; Max-Age=0${production?'; Secure':''}`]});return res.end();
+        }catch{return send(401,{error:'Microsoft sign-in could not be completed. Check school account assignment, app roles, and configuration, then retry.'});}
+      }
+      if(!path.startsWith('/api/')){
+        const file=routes[path];if(!['GET','HEAD'].includes(req.method)||!file){res.writeHead(404,headers);return res.end('Not found');}
+        const content=await readFile(new URL(file,import.meta.url));res.writeHead(200,{...headers,'Content-Type':file.endsWith('.js')?'text/javascript':file.endsWith('.css')?'text/css':'text/html'});return res.end(req.method==='HEAD'?undefined:content);
+      }
+      // Browser mutations must originate from the configured application origin.
+      if(!['GET','HEAD'].includes(req.method)){
+        const expected=appOrigin||`http://${req.headers.host}`;
+        if(req.headers.origin!==expected || req.headers['content-type']?.split(';')[0]!=='application/json')return send(403,{error:'Request origin or content type is not permitted.'});
+      }
+      let body={};if(!['GET','HEAD'].includes(req.method)){
+        const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>5_000_000)return send(413,{error:'Request exceeds the 5 MB limit.'});chunks.push(chunk);}
+        try{body=JSON.parse(Buffer.concat(chunks).toString());}catch{return send(400,{error:'Invalid JSON request.'});}
+        if(!body || typeof body!=='object'||Array.isArray(body))return send(400,{error:'Invalid request object.'});
+      }
+      const setupRequired=!db.prepare('SELECT 1 FROM users LIMIT 1').get();
+      if(path==='/api/session' && req.method==='GET'){
+        const user=getUser();return send(200,{setupRequired:localAuth&&setupRequired,authMode:localAuth?'local':'microsoft',microsoftConfigured:microsoft.configured,user:user?{username:user.username,role:user.role}:null});
+      }
+      if((path==='/api/setup'||path==='/api/login')&&req.method==='POST'){
+        if(!localAuth)return send(403,{error:'Use Microsoft school sign-in.'});
+        const attemptKey=String(req.socket.remoteAddress);const attempt=attempts.get(attemptKey);const time=Date.now();
+        if(attempt&&attempt.until>time&&attempt.count>=10)return send(429,{error:'Too many sign-in attempts. Try again in 15 minutes.'});
+        if(!attempt||attempt.until<=time)attempts.set(attemptKey,{count:1,until:time+900000});else attempt.count++;
+        const {username,password}=body;
+        if(typeof username!=='string'||typeof password!=='string'||! /^[a-zA-Z0-9._-]{3,40}$/.test(username)||password.length>128)return send(400,{error:'Use a 3–40 character staff username and a valid password.'});
+        let user;
+        if(path==='/api/setup'){
+          if(!localAuth||!setupRequired||setupConsumed)return send(403,{error:'Initial administrator setup is unavailable.'});
+          // Initial setup is only available from loopback; public deployments must provision locally first.
+          if(!['127.0.0.1','::1','::ffff:127.0.0.1'].includes(req.socket.remoteAddress)||production)return send(403,{error:'Provision the initial administrator locally before production deployment.'});
+          if(password.length<12)return send(400,{error:'Use a password of at least 12 characters.'});
+          const salt=randomBytes(24).toString('hex');const result=db.prepare('INSERT INTO users(username,password_hash,salt,role,created_at) VALUES(?,?,?,?,?)').run(username,passwordHash(password,salt),salt,'admin',new Date().toISOString());user={id:Number(result.lastInsertRowid),username,role:'admin'};setupConsumed=true;audit(user.id,'admin_created');
+        }else{
+          user=db.prepare('SELECT * FROM users WHERE username=?').get(username);
+          const salt=user?.salt||'invalid-user-salt';const candidate=passwordHash(password,salt);
+          if(!user||!timingSafeEqual(Buffer.from(candidate,'hex'),Buffer.from(user.password_hash,'hex')))return send(401,{error:'Invalid username or password.'});
+        }
+        attempts.delete(attemptKey);const token=randomBytes(32).toString('hex');db.prepare('DELETE FROM sessions WHERE expires<?').run(time);db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(hash(token),user.id,time+8*3600000);audit(user.id,'login');
+        return send(200,{user:{username:user.username,role:user.role}},{'Set-Cookie':`attendance_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${production?'; Secure':''}`});
+      }
+      const user=getUser();if(!user)return send(401,{error:'Sign in to access attendance.'});
+      if(path==='/api/logout'&&req.method==='POST'){const token=getToken();if(token)db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hash(token));return send(200,{ok:true},{'Set-Cookie':`attendance_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${production?'; Secure':''}`});}
+      if(path==='/api/records'&&req.method==='GET'){audit(user.id,'records_read');return send(200,{records:db.prepare('SELECT date,student_code,grade,division,status FROM attendance ORDER BY date,student_code').all()});}
+      if(path==='/api/records'&&req.method==='POST'){
+        if(!Array.isArray(body.records)||!body.records.length||body.records.length>30000)return send(400,{error:'Supply between 1 and 30,000 student records.'});
+        let records;try{records=body.records.map(r=>{if(!r||typeof r!=='object'||Object.keys(r).sort().join(',')!=='date,division,grade,status,student_code')throw Error('Only coded attendance fields may be saved.');const clean=validateRecord(r);if(clean.division!==divisionForGrade(clean.grade))throw Error('Division must match the student’s grade.');return clean;});}catch(e){return send(400,{error:e.message});}
+        const seen=new Set();for(const r of records){const key=r.date+'|'+r.student_code;if(seen.has(key))return send(400,{error:'Duplicate student/date entries are not permitted.'});seen.add(key);}
+        const insert=db.prepare('INSERT INTO attendance VALUES(?,?,?,?,?,?,?) ON CONFLICT(date,student_code) DO UPDATE SET grade=excluded.grade,division=excluded.division,status=excluded.status,updated_by=excluded.updated_by,updated_at=excluded.updated_at');
+        db.exec('BEGIN IMMEDIATE');try{for(const r of records)insert.run(r.date,r.student_code,r.grade,r.division,r.status,user.id,new Date().toISOString());audit(user.id,'records_saved',records.length);db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}
+        return send(200,{saved:records.length});
+      }
+      if(path==='/api/records'&&req.method==='DELETE'){
+        if(typeof body.date!=='string'||typeof body.student_code!=='string')return send(400,{error:'Specify the attendance date and student code.'});
+        const result=db.prepare('DELETE FROM attendance WHERE date=? AND student_code=?').run(body.date,body.student_code);audit(user.id,'record_deleted',Number(result.changes));return send(200,{deleted:Number(result.changes)});
+      }
+      if(path==='/api/users'&&req.method==='GET'){if(user.role!=='admin')return send(403,{error:'Administrator access required.'});return send(200,{users:db.prepare('SELECT id,username,role FROM users ORDER BY username').all()});}
+      if(path==='/api/users'&&req.method==='POST'){
+        if(!localAuth)return send(403,{error:'Manage staff assignments and roles in Microsoft Entra.'});
+        if(user.role!=='admin')return send(403,{error:'Administrator access required.'});const {username,password}=body;
+        if(typeof username!=='string'||! /^[a-zA-Z0-9._-]{3,40}$/.test(username)||typeof password!=='string'||password.length<12||password.length>128)return send(400,{error:'Use a 3–40 character username and a 12–128 character password.'});
+        if(db.prepare('SELECT 1 FROM users WHERE username=?').get(username))return send(409,{error:'This username is already registered.'});
+        const salt=randomBytes(24).toString('hex');db.prepare('INSERT INTO users(username,password_hash,salt,role,created_at) VALUES(?,?,?,?,?)').run(username,passwordHash(password,salt),salt,'staff',new Date().toISOString());audit(user.id,'staff_created');return send(201,{ok:true});
+      }
+      if(path==='/api/users'&&req.method==='DELETE'){
+        if(!localAuth)return send(403,{error:'Manage staff access in Microsoft Entra. Existing sessions expire within eight hours.'});
+        if(user.role!=='admin')return send(403,{error:'Administrator access required.'});if(!Number.isSafeInteger(body.id)||body.id===user.id)return send(400,{error:'Choose another staff account.'});
+        // Retain authorship, disable credentials, and revoke all sessions.
+        const target=db.prepare('SELECT role FROM users WHERE id=?').get(body.id);if(!target||target.role!=='staff')return send(400,{error:'Choose a staff account.'});const salt=randomBytes(24).toString('hex');db.prepare('UPDATE users SET password_hash=?,salt=? WHERE id=?').run(passwordHash(randomBytes(32).toString('hex'),salt),salt,body.id);db.prepare('DELETE FROM sessions WHERE user_id=?').run(body.id);audit(user.id,'staff_access_revoked');return send(200,{ok:true});
+      }
+      return send(404,{error:'Not found.'});
+      function getToken(){return req.headers.cookie?.split(';').map(s=>s.trim()).find(s=>s.startsWith('attendance_session='))?.slice('attendance_session='.length);}
+      function getUser(){const token=getToken();if(!token||! /^[a-f0-9]{64}$/.test(token))return null;return db.prepare('SELECT users.id,users.username,users.role FROM sessions JOIN users ON users.id=sessions.user_id WHERE token_hash=? AND expires>?').get(hash(token),Date.now());}
+    }catch{if(!res.headersSent)send(500,{error:'The server could not complete the request. Please retry.'});else res.end();}
+  });
+  server.on('close',()=>db.close());return server;
+}
+if(process.argv[1]&&import.meta.url===pathToFileURL(resolve(process.argv[1])).href){const server=await createApp();server.listen(Number(process.env.PORT||3000),process.env.HOST||'127.0.0.1',()=>console.log('Attendance application listening on port '+(process.env.PORT||3000)));}

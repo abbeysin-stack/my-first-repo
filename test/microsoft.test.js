@@ -1,0 +1,25 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {generateKeyPairSync,sign} from 'node:crypto';
+import {createMicrosoftAuth} from '../microsoft.js';
+import {createApp} from '../server.js';
+import {once} from 'node:events';
+const tenantId='11111111-1111-1111-1111-111111111111',clientId='22222222-2222-2222-2222-222222222222';
+const config={tenantId,clientId,clientSecret:'fictional-test-secret-not-a-credential',origin:'https://school.example'};
+const {privateKey,publicKey}=generateKeyPairSync('rsa',{modulusLength:2048});
+const key={...publicKey.export({format:'jwk'}),kid:'test-key'};
+function signed(claims){const header=Buffer.from(JSON.stringify({alg:'RS256',kid:'test-key'})).toString('base64url');const body=Buffer.from(JSON.stringify(claims)).toString('base64url');return header+'.'+body+'.'+sign('RSA-SHA256',Buffer.from(header+'.'+body),privateKey).toString('base64url');}
+function fixture(override={},corrupt=false){let nonce;const requests=[];const auth=createMicrosoftAuth(config,async(url,options)=>{requests.push({url,options});if(url.endsWith('/keys'))return Response.json({keys:[key]});const now=Math.floor(Date.now()/1000);const token=signed({iss:`https://login.microsoftonline.com/${tenantId}/v2.0`,aud:clientId,tid:tenantId,oid:'33333333-3333-3333-3333-333333333333',nonce,exp:now+300,nbf:now-10,roles:['Attendance.Staff'],...override});return Response.json({id_token:corrupt?token.slice(0,token.lastIndexOf('.')+1)+Buffer.alloc(256).toString('base64url'):token});});const start=auth.begin(),url=new URL(start.url);nonce=url.searchParams.get('nonce');const params=new URLSearchParams({code:'fictional-code',state:url.searchParams.get('state')});return {auth,start,url,params,requests};}
+test('Microsoft flow uses tenant scope, PKCE, cookie-bound state and signed, assigned school identity',async()=>{const f=fixture();assert.equal(f.url.hostname,'login.microsoftonline.com');assert.equal(f.url.searchParams.get('code_challenge_method'),'S256');assert.equal(f.url.searchParams.get('scope'),'openid');assert.deepEqual(await f.auth.complete(f.params,f.start.binding),{oid:'33333333-3333-3333-3333-333333333333',role:'staff'});assert.ok(f.requests[0].options.body.get('code_verifier'));await assert.rejects(f.auth.complete(f.params,f.start.binding),/state/);});
+test('wrong binding rejected before contacting Microsoft',async()=>{const f=fixture();await assert.rejects(f.auth.complete(f.params,'wrong-cookie'),/state/);assert.equal(f.requests.length,0);});
+test('wrong tenant, audience, nonce, expiration and absent role all reject',async()=>{for(const claims of [{tid:'wrong-tenant'},{aud:'wrong-client'},{nonce:'wrong-nonce'},{exp:0},{roles:[]}]){const f=fixture(claims);await assert.rejects(f.auth.complete(f.params,f.start.binding));}});
+test('administrator role mapped explicitly',async()=>{const f=fixture({roles:['Attendance.Admin']});assert.equal((await f.auth.complete(f.params,f.start.binding)).role,'admin');});
+test('Microsoft configuration must use HTTPS and tenant-scoped GUIDs',()=>assert.throws(()=>createMicrosoftAuth({...config,tenantId:'common'}),/GUID/));
+
+test('a forged token signature is rejected',async()=>{const f=fixture({},true);await assert.rejects(f.auth.complete(f.params,f.start.binding),/signature/);});
+test('Microsoft callback creates an authenticated shared session and disables password sign-in',async()=>{
+ let nonce;
+ const server=await createApp({dbPath:':memory:',microsoftConfig:config,fetchImpl:async(url)=>{if(url.endsWith('/keys'))return Response.json({keys:[key]});const now=Math.floor(Date.now()/1000);return Response.json({id_token:signed({iss:`https://login.microsoftonline.com/${tenantId}/v2.0`,aud:clientId,tid:tenantId,oid:'33333333-3333-3333-3333-333333333333',nonce,exp:now+300,nbf:now-10,roles:['Attendance.Staff']})});}});
+ server.listen(0,'127.0.0.1');await once(server,'listening');const base='http://127.0.0.1:'+server.address().port;
+ try{const start=await fetch(base+'/auth/microsoft',{redirect:'manual'});assert.equal(start.status,302);const url=new URL(start.headers.get('location'));nonce=url.searchParams.get('nonce');const binding=start.headers.get('set-cookie').split(';')[0];const callback=await fetch(base+'/auth/microsoft/callback?'+new URLSearchParams({code:'fictional-code',state:url.searchParams.get('state')}),{headers:{Cookie:binding},redirect:'manual'});assert.equal(callback.status,302);const sessionCookie=callback.headers.getSetCookie().find(x=>x.startsWith('attendance_session=')).split(';')[0];const session=await (await fetch(base+'/api/session',{headers:{Cookie:sessionCookie}})).json();assert.equal(session.user.role,'staff');assert.equal(session.authMode,'microsoft');assert.equal((await fetch(base+'/api/records',{headers:{Cookie:sessionCookie}})).status,200);assert.equal((await fetch(base+'/api/login',{method:'POST',headers:{Origin:base,'Content-Type':'application/json'},body:JSON.stringify({username:'test',password:'fictional-test-password'})})).status,403);}finally{await new Promise(r=>server.close(r));}
+});

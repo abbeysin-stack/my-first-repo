@@ -1,13 +1,116 @@
-import test from 'node:test';
-import assert from 'node:assert/strict';
-import {importStudents,mergeRecords,aggregateStudents,exportStudents,validateRecord,validateRosterStudent,parseRosterCSV} from '../src/students.js';
-const r={date:'2026-10-29',student_code:'S-A7K9M2Q4',grade:'3',division:'Junior School (PYP)',status:'absent'};
-test('extra PII columns discarded, only safe schema retained',()=>{const rows=importStudents('date,student_code,grade,division,status,name,email\n2026-10-29,S-A7K9M2Q4,3,Junior School (PYP),absent,PRIVATE_NAME,private@example.com',['Junior School (PYP)']);assert.deepEqual(rows,[{...r,reason:'unexplained'}]);assert.doesNotMatch(exportStudents(rows),/PRIVATE_NAME|example.com/);});
-test('student-date upsert prevents double-counting',()=>{const records=mergeRecords([r],[{...r,status:'present'}]);assert.equal(records.length,1);assert.equal(records[0].status,'present');assert.equal(aggregateStudents(records,r.date)[0].present,1);});
-test('duplicate entries within an import are rejected',()=>assert.throws(()=>importStudents('date,student_code,grade,division,status\n2026-10-29,S-A7K9M2Q4,3,Junior School (PYP),absent\n2026-10-29,S-A7K9M2Q4,3,Junior School (PYP),present',['Junior School (PYP)']),/Duplicate/));
-test('coded CSV roundtrip retains multiday history',()=>{const records=[r,{...r,date:'2026-10-28',status:'present'}];assert.deepEqual(importStudents(exportStudents(records),['Junior School (PYP)']),records.map(validateRecord));assert.equal(aggregateStudents(records,'2026-10-29')[0].absent,1);assert.doesNotMatch(JSON.stringify(aggregateStudents(records,r.date)),/S-A7K9M2Q4/);});
-test('invalid dates, grades, statuses and personal-name identifiers rejected',()=>{for(const invalid of [{student_code:'Jane Smith'},{date:'2026-02-30'},{grade:'14'},{status:'unknown'}])assert.throws(()=>validateRecord({...r,...invalid}));});
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  importStudents,
+  mergeRecords,
+  aggregateStudents,
+  exportStudents,
+  validateRecord,
+  validateRosterStudent,
+  parseRosterCSV,
+} from "../src/students.js";
+const r = {
+  date: "2026-10-29",
+  student_code: "S-A7K9M2Q4",
+  grade: "3",
+  division: "Junior School (PYP)",
+  status: "absent",
+};
+test("extra PII columns discarded, only safe schema retained", () => {
+  const rows = importStudents(
+    "date,student_code,grade,division,status,name,email\n2026-10-29,S-A7K9M2Q4,3,Junior School (PYP),absent,PRIVATE_NAME,private@example.com",
+    ["Junior School (PYP)"],
+  );
+  assert.deepEqual(rows, [{ ...r, reason: "unexplained" }]);
+  assert.doesNotMatch(exportStudents(rows), /PRIVATE_NAME|example.com/);
+});
+test("student-date upsert prevents double-counting", () => {
+  const records = mergeRecords([r], [{ ...r, status: "present" }]);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].status, "present");
+  assert.equal(aggregateStudents(records, r.date)[0].present, 1);
+});
+test("duplicate entries within an import are rejected", () =>
+  assert.throws(
+    () =>
+      importStudents(
+        "date,student_code,grade,division,status\n2026-10-29,S-A7K9M2Q4,3,Junior School (PYP),absent\n2026-10-29,S-A7K9M2Q4,3,Junior School (PYP),present",
+        ["Junior School (PYP)"],
+      ),
+    /Duplicate/,
+  ));
+test("coded CSV roundtrip retains multiday history", () => {
+  const records = [r, { ...r, date: "2026-10-28", status: "present" }];
+  assert.deepEqual(
+    importStudents(exportStudents(records), ["Junior School (PYP)"]),
+    records.map(validateRecord),
+  );
+  assert.equal(aggregateStudents(records, "2026-10-29")[0].absent, 1);
+  assert.doesNotMatch(
+    JSON.stringify(aggregateStudents(records, r.date)),
+    /S-A7K9M2Q4/,
+  );
+});
+test("invalid dates, grades, statuses and personal-name identifiers rejected", () => {
+  for (const invalid of [
+    { student_code: "Jane Smith" },
+    { date: "2026-02-30" },
+    { grade: "14" },
+    { status: "unknown" },
+  ])
+    assert.throws(() => validateRecord({ ...r, ...invalid }));
+});
 
-test('named roster imports retain requested identifiers and discard unrecognized PII',()=>{const students=parseRosterCSV('display_name,registration_number,grade,phone,email\nAva R.,000123,3,PRIVATE_PHONE,private@example.com');assert.deepEqual(students,[{grade:'3',display_name:'Ava R.',registration_number:'000123'}]);assert.doesNotMatch(JSON.stringify(students),/PRIVATE_PHONE|example.com/);assert.deepEqual(validateRosterStudent(students[0]),students[0]);});
-test('coded exports exclude names, registration numbers, and written notes',()=>{const note='PRIVATE_STAFF_NOTE';const text=exportStudents([{...r,reason:'appointment',display_name:'Ava R.',registration_number:'000123',note}]);assert.doesNotMatch(text,/Ava R|000123|PRIVATE_STAFF_NOTE|note|registration_number|display_name/);assert.match(text,/appointment/);assert.match(text,/S-A7K9M2Q4/);});
-test('notes import for staff-only history but stay out of coded exports',()=>{const rows=importStudents('date,student_code,grade,division,status,reason,note\n2026-10-29,S-A7K9M2Q4,3,Junior School (PYP),absent,family,PRIVATE_STAFF_NOTE',['Junior School (PYP)']);assert.equal(rows[0].note,'PRIVATE_STAFF_NOTE');assert.doesNotMatch(exportStudents(rows),/PRIVATE_STAFF_NOTE/);});
+test("named roster imports retain requested identifiers and discard unrecognized PII", () => {
+  const students = parseRosterCSV(
+    "display_name,registration_number,grade,phone,email\nAva R.,000123,3,PRIVATE_PHONE,private@example.com",
+  );
+  assert.deepEqual(students, [
+    { grade: "3", display_name: "Ava R.", registration_number: "000123" },
+  ]);
+  assert.doesNotMatch(JSON.stringify(students), /PRIVATE_PHONE|example.com/);
+  assert.deepEqual(validateRosterStudent(students[0]), students[0]);
+});
+test("coded exports exclude names, registration numbers, and written notes", () => {
+  const note = "PRIVATE_STAFF_NOTE";
+  const text = exportStudents([
+    {
+      ...r,
+      reason: "appointment",
+      display_name: "Ava R.",
+      registration_number: "000123",
+      note,
+    },
+  ]);
+  assert.doesNotMatch(
+    text,
+    /Ava R|000123|PRIVATE_STAFF_NOTE|note|registration_number|display_name/,
+  );
+  assert.match(text, /appointment/);
+  assert.match(text, /S-A7K9M2Q4/);
+});
+test("notes import for staff-only history but stay out of coded exports", () => {
+  const rows = importStudents(
+    "date,student_code,grade,division,status,reason,note\n2026-10-29,S-A7K9M2Q4,3,Junior School (PYP),absent,family,PRIVATE_STAFF_NOTE",
+    ["Junior School (PYP)"],
+  );
+  assert.equal(rows[0].note, "PRIVATE_STAFF_NOTE");
+  assert.doesNotMatch(exportStudents(rows), /PRIVATE_STAFF_NOTE/);
+});
+
+test("late arrivals validate time, manual contact status and written staff context", () => {
+  const value = validateRecord({
+    ...r,
+    status: "late",
+    arrival_time: "08:27",
+    parent_notified: true,
+    note: "Office arrival recorded.",
+  });
+  assert.equal(value.note, "Office arrival recorded.");
+  assert.equal(value.arrival_time, "08:27");
+  assert.equal(value.parent_notified, true);
+  assert.throws(() =>
+    validateRecord({ ...r, status: "late", arrival_time: "25:00" }),
+  );
+  assert.throws(() => validateRecord({ ...r, parent_notified: "yes" }));
+});

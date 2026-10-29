@@ -1,18 +1,65 @@
-# Attend — school attendance workspace
+# Attend — environment and school deployment
 
-A shared school attendance application with Microsoft Entra staff sign-in, a SQLite database, grade-level entry, staff-only student identities and absence histories, CSV interchange, and formatted leadership email drafts. Node.js 24.5+ is required (validated on 24.19). No npm dependencies or build step are required.
+This branch is the structural review of the uploaded engineering specification. Read [docs/SPECIFICATION_REVIEW.md](docs/SPECIFICATION_REVIEW.md) for the implementation/acceptance matrix. No school deployment, legal-compliance certification or live Microsoft acceptance is implied by a successful local build.
 
-## Start and validate
+## Install, run and validate
+
+Node.js 24.5+ is required; validated on 24.19. Use the existing checkout: each cloud task is already isolated, so no Git worktree is needed.
 
 ```sh
 cd /workspace/my-first-repo
+npm ci
+npm run lint
 npm test
-npm start
+npm run build
+npm run serve
 ```
 
-The default listener is loopback port 3000. Without Microsoft settings, the sign-in screen explains configuration and offers a fictional demo. The real attendance API remains locked. Demo data is never saved to the shared database. Use the existing checkout: each cloud task is already isolated; no Git worktree is needed.
+`npm start` builds the frontend and starts the service in one command. `npm run serve` reuses an existing `dist/` build. In this restricted cloud machine use `npm ci --cache /tmp/attendance-npm-cache` so the package cache is writable. The dependency lockfile is committed. The start command enables Node's environment-proxy support and preserves TLS verification.
 
-## School divisions
+The default listener is loopback port 3000. Without Microsoft configuration, the application offers only a fictional review workspace and real attendance endpoints return 401. Open the private port in Codespaces or use a browser on the same host. GitHub Pages cannot run the backend. Use a trusted TLS reverse proxy and keep the Node port private for school deployment.
+
+For hot-reload development run `npm run serve` and `npm run dev` in separate terminals. Vite serves the frontend and proxies API/auth requests to port 3000. Production should serve the built assets, not the Vite development server.
+
+## Microsoft school sign-in
+
+A school Microsoft Entra administrator must register and assign the application. Never put secrets in Git, instructions, command output, or chat.
+
+1. Choose a stable HTTPS address. Set `APP_ORIGIN` to the exact origin, without a trailing slash/path, such as `https://attendance.school.example`.
+2. Create an Entra app registration for **Accounts in this organizational directory only**. Add a **Web** redirect URI: `https://YOUR-APP-HOST/auth/microsoft/callback`. Do not use the SPA or implicit grant configuration.
+3. Configure these through secure environment settings:
+
+   | Variable | Purpose |
+   | --- | --- |
+   | `MS_TENANT_ID` | School directory GUID |
+   | `MS_CLIENT_ID` | App registration/client GUID |
+   | `MS_CLIENT_SECRET` | Server client secret, entered securely; rotate before expiry |
+   | `APP_ORIGIN` | Exact HTTPS origin |
+   | `NODE_ENV` | `production` for HTTPS validation, Secure cookies, HSTS |
+   | `ATTENDANCE_DB_PATH` | Optional protected durable database path; default `.local/attendance.sqlite` |
+
+4. Enable application roles for users/groups. Supported role values:
+
+   | Entra role | Application permission |
+   | --- | --- |
+   | `Attendance.Admin` | All views, account scope administration, calendar, register reopening |
+   | `Attendance.Secretary` | School roster intake, attendance, grade totals, finalization and reporting |
+   | `Attendance.Teacher` | Assigned-class roster and attendance only |
+   | `Attendance.DivisionHead` | Assigned-division read-only records and follow-up |
+   | `Attendance.Executive` | School aggregate data only, no individual students or notes |
+   | `Attendance.Staff` | Legacy staff role; defaults to secretary or the application's administrator-assigned persona |
+
+5. Require assignment in Enterprise applications and assign authorized staff/groups. Only `openid` is requested; this integration does not read a guardian directory or Microsoft Graph. Follow the school's consent policy.
+6. Teachers/division heads have no student access until an administrator assigns the exact class/division in **Administration**. The user appears after first sign-in. Scope changes revoke existing application sessions; the user must sign in again. Explicit Entra persona roles are reapplied at subsequent sign-in; the stored class/division scope remains. Administrators may review all workspace presentations; a view switch never changes server authorization.
+7. Allow server HTTPS access to `login.microsoftonline.com`. Restart after setting configuration and test assigned, unassigned and external-tenant accounts using fictional data.
+
+The integration uses authorization code + PKCE, cookie-bound state, nonce, Microsoft JWKS signatures, issuer/audience/tenant validation, time bounds and assigned roles. Session tokens are hashed in SQLite, HttpOnly, SameSite and Secure in production, with an eight-hour lifetime. No passwords/identity tokens are placed in browser application storage. Removing an Entra assignment blocks new sign-in; an existing app session may remain usable until expiry unless its database session is revoked or the service is stopped.
+
+Official reference: https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow
+
+Live school sign-in remains unverified until the school registration, secret, HTTPS address and assignments exist. Automated identity tests use locally signed fixtures, not a real tenant.
+
+## Divisions, roster and record contracts
 
 | Grades | Division |
 | --- | --- |
@@ -21,59 +68,36 @@ The default listener is loopback port 3000. Without Microsoft settings, the sign
 | 8–10 | Secondary (IGCSE) |
 | 11–12 | Secondary (IB DP) |
 
-Division is derived from grade on entry and verified on CSV import and server writes. The Secretary attendance desk supports grade totals or a clickable student roster with separate display-name and registration-number columns. One entry method is allowed per grade/date, enforced by the API to prevent double counting. One student/date has one attendance record; later saves update it. Grade totals calculate present from student count minus absent, leave, and late, and do not create individual histories. CSV imports reject duplicate student/date rows within a file. Present ÷ all recorded students is the attendance rate. Absent, leave, and late are separate; late is the supported exception category. Unrecorded students cannot be inferred without a roster, so the report describes recorded headcount rather than total enrollment.
+This mapping follows the user's earlier instructions, rather than the PDF's three generic divisions. Grade is a string from `1` through `12`; division is validated server-side.
 
-## Microsoft school sign-in
+Named roster CSV: `display_name,registration_number,grade`, with optional `class_name,house,student_code`. `display_name` is first name(s) plus a single last initial, e.g. `Ava R.`. Registration is text, including leading zeros. New opaque internal codes are generated using cryptographic randomness. Reusing a registration number updates the same student. Use the optional existing `student_code` to link legacy history; conflicting identity links are rejected. Legacy `student_code,grade` imports remain supported. Class labels must exactly match staff assignments, e.g. `10-A`. House labels are school-defined.
 
-A school Microsoft Entra administrator must complete these steps. Live Microsoft sign-in cannot be validated until the school registration, secret, and HTTPS deployment exist.
+Attendance CSV: `date,student_code,grade,division,status`, with optional `reason,note`. Dates use `YYYY-MM-DD`; status is `present`, `absent`, `late`, `excused`, `half_day` or legacy `leave`. The API additionally supports boolean `parent_notified` and `arrival_time` (`HH:mm`). These two fields are entered in the interface/API rather than the legacy CSV reader. Parent confirmation means contact has already occurred; it sends nothing.
 
-1. Choose the application's stable HTTPS address and configure a TLS reverse proxy to the loopback application. Set `APP_ORIGIN` to that exact origin, such as `https://attendance.school.example`, with no trailing slash or path. Keep the Node port inaccessible from the public internet.
-2. In Microsoft Entra admin center, create an app registration for **Accounts in this organizational directory only**. Add a **Web** redirect URI of `https://YOUR-APP-HOST/auth/microsoft/callback`. Do not select SPA or enable implicit token grants. The application uses authorization code flow with PKCE and server-side client authentication.
-3. Record the Directory (tenant) ID and Application (client) ID. Create an app client secret, store it through secure environment settings, and arrange rotation before it expires. Never commit or paste the secret into chat. Configure:
+Reason values: `illness`, `appointment`, `family`, `authorized`, `unexplained`, `school_event`, `religious`, `visa`, `other`. Reasons apply to absence/excused/leave/half-day records. Notes are optional plain text up to 1,000 characters; present clears note/reason context. Late arrivals support a staff note and arrival time. Notes are escaped for rendering, not automatically scrubbed for medical or personal details. Unknown extra CSV fields are removed before API requests. Raw CSV files stay in the browser. Import bounds: 5 MB, 10,000 roster students, 30,000 attendance records per batch. Export Excel worksheets as UTF-8 CSV for import.
 
-   | Variable | Purpose |
-   | --- | --- |
-   | `MS_TENANT_ID` | School directory GUID |
-   | `MS_CLIENT_ID` | App registration GUID |
-   | `MS_CLIENT_SECRET` | Secret supplied securely to the server |
-   | `APP_ORIGIN` | Exact public HTTPS origin |
-   | `NODE_ENV` | `production` for secure cookies and HTTPS enforcement |
-   | `ATTENDANCE_DB_PATH` | Database location on a durable, restricted volume; default `.local/attendance.sqlite` |
+One student/date has one record. CSV duplicate student/date rows are rejected; subsequent saves update that record. Grade counts and individual records are mutually exclusive per grade/date, enforced by the API. Counts calculate present = total minus absent, leave, late, excused and half-day. Counts do not create individual history or establish an individual muster list. Unmarked students are never silently assumed present; bulk-present explicitly confirms the unmarked students and preserves exceptions.
 
-4. In the app registration, define app roles for users/groups with exact **values** `Attendance.Admin` and `Attendance.Staff`. Enable them. In Enterprise applications, require assignment and assign authorized school staff/groups to the appropriate role. This app requests only `openid`, not student directories or Microsoft Graph. Consent must follow your school's tenant policy.
-5. Allow server HTTPS access to `login.microsoftonline.com`. `npm start` uses Node's environment-proxy support, preserving TLS verification. Public browser access to Microsoft's sign-in resources is handled through your school network.
-6. Restart the application after setting its configuration. Sign in as an assigned staff member, save a fictional attendance row, reload, and verify the row persists. Check that an unassigned school user and an external-tenant account cannot access it. Remove the test row before entering approved data.
+## Calculations, reporting and finalization
 
-The server validates JWT signatures with Microsoft's tenant key set, issuer, audience, tenant, nonce, time bounds, and assigned roles. Sessions expire after eight hours, use hashed tokens in SQLite, and use HttpOnly, SameSite cookies (`Secure` in production). Login state is short-lived and cookie-bound. No passwords or identity tokens are sent to the browser. The local user table stores the opaque Microsoft object ID and application role, not staff profile names or email addresses. Removing an Entra assignment prevents new sign-ins; existing app sessions remain valid for up to eight hours. For urgent revocation, administrators must revoke the relevant application sessions in the database or stop the service. All assigned staff currently have access to all divisions; division-scoped permissions are not implemented.
+- Daily KPI/email rate: **present / all submitted records**. Late, excused, half-day and leave stay separate. Half-day does not receive 0.5 present credit under this rule.
+- Calendar rate: **present / current roster enrollment**. Thresholds are >=95% goal, >=90% normal, >=85% warning, <85% concern. No data, weekends and configured non-instructional dates are neutral. Missing submissions affect coverage. Historical enrollment is not reconstructed.
+- House/class filters use individual records only; grade totals cannot be attributed to a house or classroom.
+- Warning list: present rate below 90% across recorded instructional days, or at least three consecutive unexplained absences. Missing instructional dates break a streak; weekends/configured closed dates do not. Small sample sizes are displayed. Warnings are prompts for staff review, not findings of truancy or diagnoses.
+- Finalization requires complete current roster coverage for each individual grade/day, or saved grade totals. Pending changes must be saved/discarded first. Finalization locks API updates/deletions and totals; only an administrator can reopen. Roster enrollment changes and historical snapshots need school governance; finalization does not prove a live campus location.
 
-Official reference: https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow
+The email preview uses a sandboxed iframe. EML contains standard multipart plain-text/HTML alternatives, UTF-8 base64 and X-Unsent. HTML uses inline styles and fixed-width table layout. PDF uses native browser print; PNG captures only the monthly aggregate report; Excel uses a minimal OOXML workbook with inline literal cells, not formulas. All fictional artifacts are labeled demo. Exports omit names, registrations, reason descriptions and staff notes. Small division groups are withheld; aggregation still does not guarantee anonymity. Specific Outlook clients and printers require school acceptance testing.
 
-## Student privacy and CSV handling
+## Data protection, live synchronization and offline behavior
 
-The authenticated staff register intentionally stores first name plus last initial, registration number, and optional written absence notes, as requested. These are identifying/sensitive personal data, not anonymous records. All assigned Attendance.Staff and Attendance.Admin users can view the register across divisions. Leadership emails contain only division aggregates. Coded attendance CSV exports omit display names, registration numbers, and written notes; they retain internal codes, grades, dates, attendance statuses, and reason codes, and therefore remain sensitive pseudonymous data rather than anonymous exports.
+The database intentionally stores the requested names/initials, registrations, staff notes, author IDs, timestamps and attendance metadata. These are personal data, not anonymous records. Secretaries/admins have full school access, teachers only their class, division heads only their division, and executives aggregate-only API responses. Named follow-up lists are outside the printable/PNG board report. There is no new guardian contact database.
 
-Roster CSV columns: `display_name,registration_number,grade`. Use a display name such as `Ava R.`: first name(s) followed by one last initial, not a full last name. Registration numbers are stored as text, with leading zeros preserved. Names, registration numbers, and grade are intentionally retained in the shared staff roster; unrecognized columns such as email or phone are removed in the browser. New internal codes are generated independently using cryptographic randomness. Re-importing the same registration number updates that student while retaining the internal code and historical records. Legacy `student_code,grade` CSVs remain supported; include `student_code` alongside the new identity columns to link old coded history. Conflicting identity links are rejected. Legacy rows without identities show “Identity not entered.” The system does not merge different existing student identities automatically.
+Live server events carry only a revision notice; the browser then fetches data through the current role/scope filter. A polling fallback refreshes visible workspaces. In-memory attendance writes show as pending, retry after reconnection, and remain blocked on a finalization/permission conflict until resolved/discarded. Queue contents are never written to local storage and are lost on reload/tab closure. The browser warns before leaving with pending writes. No background authentication, durable offline database, automatic parent communication or automatic leadership sending is implemented.
 
-Attendance CSV columns: `date,student_code,grade,division,status`, with optional `reason` and `note`. Dates use `YYYY-MM-DD`. Status is `present`, `absent`, `leave`, or `late`. Absence reasons use `illness`, `appointment`, `family`, `authorized`, or `unexplained`, and apply only to absent records. An optional staff note is limited to 1,000 characters and applies only to absence. Notes are stored as written, rendered as escaped text, and are not automatically scrubbed for personal or medical information. Keep only the context needed for attendance follow-up. A status change from absent to present, leave, or late clears its reason and note. The absence dialog supports editing the existing reason/note. The action audit records operations and counts, not a history of previous note versions.
+SQLite lives under ignored `.local/attendance.sqlite`, with restricted file/directory permissions, or a configured durable path. Source and lockfiles contain no school data or credentials. Protect the host and database with encrypted storage, approved access/retention and encrypted, tested backups before real use. Application-level database encryption and backup scheduling are not supplied. For a consistent backup use SQLite's backup API or stop the service and preserve DB/WAL/SHM together. Do not copy only the main file while writes are active. Back up before upgrading: startup applies additive migrations preserving old rows and adding scope, class/house, notification, arrival, finalization and change-event tables/columns.
 
-Notes and reason descriptions remain in staff histories; neither appears in leadership email drafts. Notes are also excluded from coded CSV exports, so these exports are not complete backups of identity or note data. Back up the protected SQLite database to preserve the full staff register. Raw uploaded CSV files stay in the browser; only the supported, validated fields reach the API. Export Excel worksheets to UTF-8 CSV. CSV imports are capped at 5 MB, attendance batches at 30,000 records, and roster batches at 10,000 students.
+Current-record author/time and status events are retained for accountability. Previous note text is not versioned. The system is designed for one application instance against its SQLite database; PostgreSQL/Cloud SQL, multi-instance coordination, historical enrollment snapshots, external SIS sync and NFC/RFID are later work. Performance, accessibility, security and school emergency/compliance acceptance remain deployment requirements, not certified outcomes.
 
-Unrecorded roster students are not automatically marked present; the bulk-present action explicitly confirms the number being marked and preserves existing absences and other statuses. Leadership drafts withhold divisions below five recorded students. Small cells in larger divisions can still permit inference; this threshold reduces risk rather than guaranteeing anonymity. Review all drafts and recipients before manually sending. Generated `.eml` files can be opened in compatible email clients; automatic sending and email-provider permissions are not used. Sign-out clears names, registration searches, and note input fields from the local view.
+## Isolated local authentication tests
 
-## Storage and deployment responsibilities
-
-The default SQLite database is in `.local/attendance.sqlite`, excluded from Git, with a private directory and file permissions. SQLite provides a safe shared transactional source of truth for one application instance; CSV remains the import/export interchange format. Sharing a live CSV/Excel file as the database would risk concurrent-write corruption. The database records update authors/timestamps and an action audit without logging source files, passwords, or student identities.
-
-Use an encrypted durable volume, restrict host access, set an approved retention policy, and arrange encrypted backups before using real student data. Database encryption, hosting, backup scheduling, school policy approval, and production deployment are not supplied automatically. For a consistent backup, use SQLite's online backup API or stop the service and preserve the database with its WAL/SHM files together. Do not copy only the SQLite main file while writes are active. Test restoration. Run one application instance per database volume; scale-out and directory-wide roster integration are outside this version.
-
-The app loads shared history at sign-in and after its own writes. A browser refresh retrieves changes made by another staff member; real-time synchronization is not implemented. Sign-out clears the local working view and revokes that browser session without deleting saved records. Removing a day's record is an explicit shared database deletion. Exported files stay on the staff device and must be handled under school policy.
-
-## Local development tests without a Microsoft tenant
-
-The application defaults to Microsoft authentication and fails closed when configuration is absent. Developers can opt into loopback-only password authentication with `ATTENDANCE_LOCAL_AUTH=1`, using a **separate disposable database** and no real school data. The first local sign-in provisions a test administrator with a minimum 12-character password. Never enable this mode in school deployment. Production blocks local initial setup; Microsoft configuration overrides local authentication. Unit/integration tests use isolated temporary SQLite databases, fictional accounts, and locally signed mock identity tokens; they do not contact Microsoft or create real staff accounts.
-
-## Secretary workflow
-
-Sign in as assigned school staff and open **Secretary entry**. Select the reporting date and grade. In **Enter student counts**, fill in the student count and exception counts, check calculated present, and save. In **Mark individual students**, enter first name + last initial and registration number, or import the named staff roster, then click **Absent** to select a predefined reason and optionally add a written note. Grade division is automatic. Names, registration numbers, reason descriptions, and written notes are staff-only and never appear in leadership drafts. Names, registration numbers, and written notes are also omitted from coded CSV exports.
-
-If saved grade counts exist, clear them before individual marking. If individual attendance already exists for that grade/date, counts are blocked and the individual register should be completed instead. These restrictions apply across imports and API writes, not only the interface. Saved counts and rosters persist in SQLite alongside individual history. Database startup migrates older tables by adding absence-reason and note columns and staff roster identity columns, preserving existing records and seeding legacy coded rosters from the latest historical grade. Old absent entries become unexplained; identity fields and notes remain blank until entered. Back up the database before upgrading a live installation.
+Without Microsoft settings the real API stays locked. For development only, `ATTENDANCE_LOCAL_AUTH=1` enables loopback-only password authentication using a **separate disposable database** and fictional data. First setup creates a test administrator with a 12+ character password. Do not enable this in school deployment. Production blocks local initial setup; configured Microsoft authentication overrides local mode. Tests create isolated temporary databases and fictional accounts; they do not create real staff identities or contact Microsoft.

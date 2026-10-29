@@ -1,41 +1,58 @@
-# Attend — school attendance
+# Attend — School Attendance & Executive Dashboard
 
-Grade-level student attendance, staff-only student absence histories, and leadership email drafts for Junior School (PYP), Junior School (MYP), Secondary (IGCSE), and Secondary (IB DP).
+A React + TypeScript school attendance workspace for secretaries, teachers, division heads, and school leadership. This review implements the core structure from the uploaded **Business Case & Engineering Specification Document**, while keeping the previously agreed identity, privacy, division, and email-review requirements.
 
-## Try the fictional demo in GitHub Codespaces
+**Start your review with [the specification review guide](docs/SPECIFICATION_REVIEW.md).** It maps implemented features, deliberate differences, acceptance checks, and future work.
 
-1. On GitHub, select the branch containing this application.
+## Try it in GitHub Codespaces
+
+1. Select the `attendance-platform-review` branch on GitHub.
 2. Choose **Code → Codespaces → Create codespace on this branch**.
-3. In the Codespaces terminal, run:
+3. In the terminal:
 
    ```sh
    nvm install 24
    nvm use 24
-   npm test
+   npm ci
    npm start
    ```
 
-4. In **Ports**, open port **3000** in your browser and keep visibility **Private**. If it is absent, choose **Add port** and enter `3000`.
-5. Click **Explore with fictional data**.
-6. Open **Secretary entry**. Grade 1 demonstrates saved **student counts**. Change counts and save to update the division summary and email.
-7. Choose **Grade 2 → Mark individual students**. Click **Absent** beside a student, select an absence description, and save. Click **Present**, **Leave**, or **Late** to correct a status.
-8. Review division summaries, filter absence histories, and download a division email draft. Reasons and student codes stay out of leadership emails.
+4. Open port **3000** from **Ports** and keep it **Private**.
+5. Click **Explore fictional demo**. Microsoft setup is not needed for the demo.
 
-The demo needs no Microsoft registration. Its fictional records stay in browser memory and never enter the shared database. Use fictional data while evaluating.
+The demo uses 120 fictional students, four divisions, classes and houses, and a month of records. All demo changes stay in browser memory. All demo artifacts are labeled fictional.
 
-## School deployment
+## Review the workspaces
 
-Microsoft school sign-in requires an Entra app registration, assigned staff roles, secure configuration, and an HTTPS deployment. It is implemented but has not been validated against a real school tenant. Without configuration, real attendance access remains locked.
+- **Secretary:** choose a grade, enter counts or mark students, record absences and late arrivals, confirm parent contact, and verify/finalize the daily register.
+- **Teacher:** focused assigned-class roll call; mark unrecorded students present without overwriting existing exceptions.
+- **Division head:** grade/class/house filters and named early-warning follow-ups within the assigned division.
+- **Head of school:** institutional KPIs, the monthly calendar, and aggregate leadership exports. Real executive API responses do not contain student identities or notes.
 
-The authenticated staff register stores first name + last initial, registration number, and written absence notes. These are personal data, not anonymous records. Leadership drafts contain aggregates only. Coded CSV exports exclude display names, registration numbers, and written notes, but remain sensitive pseudonymous data. Roster imports keep the requested identity fields and discard unrecognized columns before saving. Shared attendance is stored in SQLite, with CSV import/export. Excel files must first be exported to CSV.
+Press **Ctrl+K / ⌘K** to find a student, **Esc** to dismiss, and **Ctrl+Enter / ⌘Enter** to save the attendance dialog. Parent contact confirmation records a contact already made; it sends no messages. Muster view shows recorded statuses and unmarked students, not a guarantee of live campus occupancy.
 
-See [SETUP.md](SETUP.md) for Microsoft setup, grade mappings, privacy boundaries, storage, and production requirements. GitHub Pages cannot run the application server.
+## Run and develop
 
-## Secretary entry
+Node.js **24.5+** is required. The tested runtime is 24.19.
 
-For each grade and date, secretaries choose one method:
+```sh
+npm ci
+npm run lint       # strict TypeScript check
+npm test           # domain, API authorization, persistence, identity, analytics, reporting
+npm run build      # TypeScript check + production frontend
+npm start          # builds and starts the application on loopback port 3000
+```
 
-- **Counts:** enter student count, absent, on leave, and late. Present is calculated. Counts feed division reporting without creating individual student histories.
-- **Individual register:** enter first name + last initial (for example, `Ava R.`) and a registration number (for example, `000123`), or import `display_name,registration_number,grade`. Internal codes are generated automatically and registration numbers retain leading zeros. The roster shows the name and registration in separate columns. Click a status beside each student. Marking absent opens a description selector (illness, appointment, family reason, authorized absence, or unexplained), plus an optional written staff note of up to 1,000 characters. Notes appear in the staff register and absence history, not leadership drafts or coded exports. `Mark unrecorded students present` requires confirmation and preserves existing absences.
+Optional browser checks: `npm run test:browser`. Install Chromium using `npx playwright install chromium` if no system browser is available; see the review guide for isolated test details.
 
-The app prevents counts and individual attendance from being saved for the same grade/date. Clear saved counts before switching to individual marking. If individual records already exist, continue using that register. Existing student attendance imports also populate the roster. Counts have a separate CSV export; coded attendance CSVs include the optional allowlisted `reason` column. Written notes are stored as entered; the app does not automatically scrub them for personal data. Include only necessary attendance context. Legacy coded rosters remain supported; an optional `student_code` column links identities to existing history. Updating the same registration number updates the roster entry without creating a second student.
+For an existing build use `npm run serve`. For hot-reload development, run `npm run serve` in one terminal and `npm run dev` in another; Vite proxies API/auth requests to port 3000. Do not expose the development server publicly.
+
+## Privacy and school deployment
+
+The authenticated staff database stores first name + last initial, registration number, and optional written attendance notes. These are personal data, not anonymous records. Student registration numbers remain text, including leading zeros; internal student codes are generated independently.
+
+Leadership HTML/EML, PDF/PNG, and Excel exports contain aggregates only. They omit names, registration numbers, reason descriptions and staff notes. Legacy coded CSV helpers remain available for interchange; coded records are pseudonymous, not anonymous. No student data or pending mutations are written to local storage. Offline roll-call writes are buffered in memory and retried, so keep the tab open until saved.
+
+School sign-in requires a Microsoft Entra registration, assigned application roles and scopes, an HTTPS deployment, and secure environment settings. Live Microsoft sign-in, school Outlook clients, production hosting, encrypted storage/backups, and compliance acceptance are still external prerequisites.
+
+See [SETUP.md](SETUP.md) for deployment, Microsoft roles, imports, calculations, permissions, and retention limitations. GitHub Pages cannot run the application backend.

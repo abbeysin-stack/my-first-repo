@@ -29,6 +29,6 @@ export function reportText(divisions,date,minimum=5){
     else lines.push(`Attendance: ${d.rate.toFixed(1)}% | Recorded headcount: ${d.total}`,`Present: ${d.present} | Exceptions (late): ${d.late}`,`Absent: ${d.absent} | Leave: ${d.leave}`);
     lines.push('');
   }
-  lines.push('Reporting basis: one record per student per day. Attendance rate = present ÷ all recorded students; leave and late remain in the denominator. Late is reported as an exception. Counts reflect submitted records and do not establish completeness against a student roster.','', 'Privacy: student-level fields are excluded. Small divisions are withheld; individual status counts in larger divisions may still be sensitive. Share only with authorized recipients.','','Regards,','Attendance Operations');
+  lines.push('Reporting basis: grade counts or individual student records, with one entry method per grade per day. Attendance rate = present ÷ all recorded students; leave and late remain in the denominator. Late is reported as an exception. Counts reflect submitted records and do not establish completeness against a student roster.','', 'Privacy: student-level fields are excluded. Small divisions are withheld; individual status counts in larger divisions may still be sensitive. Share only with authorized recipients.','','Regards,','Attendance Operations');
   return lines.join('\n');
 }

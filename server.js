@@ -6,9 +6,10 @@ import {resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {createMicrosoftAuth} from './microsoft.js';
 import {validateRecord,divisionForGrade} from './src/students.js';
+import {validateTotals} from './src/entry.js';
 const hash=value=>createHash('sha256').update(value).digest('hex');
 const passwordHash=(password,salt)=>scryptSync(password,salt,64).toString('hex');
-const routes={'/':'index.html','/src/app.js':'src/app.js','/src/core.js':'src/core.js','/src/students.js':'src/students.js','/src/style.css':'src/style.css'};
+const routes={'/':'index.html','/src/app.js':'src/app.js','/src/entry.js':'src/entry.js','/src/secretary.js':'src/secretary.js','/src/core.js':'src/core.js','/src/students.js':'src/students.js','/src/style.css':'src/style.css'};
 export async function createApp({dbPath=process.env.ATTENDANCE_DB_PATH||resolve('.local/attendance.sqlite'),production=process.env.NODE_ENV==='production',appOrigin=process.env.APP_ORIGIN,allowSetup=process.env.ATTENDANCE_LOCAL_AUTH==='1',microsoftConfig,fetchImpl}={}){
   if(production && (!appOrigin || !appOrigin.startsWith('https://')))throw Error('Production requires an HTTPS APP_ORIGIN and a trusted TLS reverse proxy.');
   if(dbPath!==':memory:'){await mkdir(resolve(dbPath,'..'),{recursive:true,mode:0o700});}
@@ -17,6 +18,11 @@ export async function createApp({dbPath=process.env.ATTENDANCE_DB_PATH||resolve(
     CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,expires INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS attendance(date TEXT NOT NULL,student_code TEXT NOT NULL,grade TEXT NOT NULL,division TEXT NOT NULL,status TEXT NOT NULL,updated_by INTEGER NOT NULL REFERENCES users(id),updated_at TEXT NOT NULL,PRIMARY KEY(date,student_code));
     CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,actor INTEGER REFERENCES users(id),action TEXT NOT NULL,record_count INTEGER NOT NULL,created_at TEXT NOT NULL);`);
+  if(!db.prepare('PRAGMA table_info(attendance)').all().some(c=>c.name==='reason'))db.exec("ALTER TABLE attendance ADD COLUMN reason TEXT NOT NULL DEFAULT ''");
+  db.exec("UPDATE attendance SET reason='unexplained' WHERE status='absent' AND reason=''");
+  db.exec(`CREATE TABLE IF NOT EXISTS roster(student_code TEXT PRIMARY KEY,grade TEXT NOT NULL,updated_by INTEGER REFERENCES users(id),updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS grade_totals(date TEXT NOT NULL,grade TEXT NOT NULL,total INTEGER NOT NULL,present INTEGER NOT NULL,absent INTEGER NOT NULL,leave INTEGER NOT NULL,late INTEGER NOT NULL,updated_by INTEGER NOT NULL REFERENCES users(id),updated_at TEXT NOT NULL,PRIMARY KEY(date,grade));
+    INSERT OR IGNORE INTO roster(student_code,grade,updated_at) SELECT a.student_code,a.grade,a.updated_at FROM attendance a WHERE a.date=(SELECT MAX(b.date) FROM attendance b WHERE b.student_code=a.student_code);`);
   if(dbPath!==':memory:')await chmod(dbPath,0o600);
   const microsoft=createMicrosoftAuth(microsoftConfig||{tenantId:process.env.MS_TENANT_ID,clientId:process.env.MS_CLIENT_ID,clientSecret:process.env.MS_CLIENT_SECRET,origin:appOrigin},fetchImpl);
   const localAuth=allowSetup&&!microsoft.configured;
@@ -84,18 +90,34 @@ export async function createApp({dbPath=process.env.ATTENDANCE_DB_PATH||resolve(
       }
       const user=getUser();if(!user)return send(401,{error:'Sign in to access attendance.'});
       if(path==='/api/logout'&&req.method==='POST'){const token=getToken();if(token)db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hash(token));return send(200,{ok:true},{'Set-Cookie':`attendance_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${production?'; Secure':''}`});}
-      if(path==='/api/records'&&req.method==='GET'){audit(user.id,'records_read');return send(200,{records:db.prepare('SELECT date,student_code,grade,division,status FROM attendance ORDER BY date,student_code').all()});}
+      if(path==='/api/records'&&req.method==='GET'){audit(user.id,'records_read');return send(200,{records:db.prepare('SELECT date,student_code,grade,division,status,reason FROM attendance ORDER BY date,student_code').all().map(({reason,...r})=>({...r,...(reason?{reason}:{})})),totals:db.prepare('SELECT date,grade,total,present,absent,leave,late FROM grade_totals ORDER BY date,grade').all(),roster:db.prepare('SELECT student_code,grade FROM roster ORDER BY grade,student_code').all()});}
       if(path==='/api/records'&&req.method==='POST'){
         if(!Array.isArray(body.records)||!body.records.length||body.records.length>30000)return send(400,{error:'Supply between 1 and 30,000 student records.'});
-        let records;try{records=body.records.map(r=>{if(!r||typeof r!=='object'||Object.keys(r).sort().join(',')!=='date,division,grade,status,student_code')throw Error('Only coded attendance fields may be saved.');const clean=validateRecord(r);if(clean.division!==divisionForGrade(clean.grade))throw Error('Division must match the student’s grade.');return clean;});}catch(e){return send(400,{error:e.message});}
+        let records;try{records=body.records.map(r=>{if(!r||typeof r!=='object'||Object.keys(r).some(k=>!['date','student_code','grade','division','status','reason'].includes(k)))throw Error('Only coded attendance fields may be saved.');const clean=validateRecord(r);if(clean.division!==divisionForGrade(clean.grade))throw Error('Division must match the student’s grade.');return clean;});}catch(e){return send(400,{error:e.message});}
+        for(const r of records)if(db.prepare('SELECT 1 FROM grade_totals WHERE date=? AND grade=?').get(r.date,r.grade))return send(409,{error:'This grade uses count entry for that date. Clear its saved counts before marking individual students.'});
         const seen=new Set();for(const r of records){const key=r.date+'|'+r.student_code;if(seen.has(key))return send(400,{error:'Duplicate student/date entries are not permitted.'});seen.add(key);}
-        const insert=db.prepare('INSERT INTO attendance VALUES(?,?,?,?,?,?,?) ON CONFLICT(date,student_code) DO UPDATE SET grade=excluded.grade,division=excluded.division,status=excluded.status,updated_by=excluded.updated_by,updated_at=excluded.updated_at');
-        db.exec('BEGIN IMMEDIATE');try{for(const r of records)insert.run(r.date,r.student_code,r.grade,r.division,r.status,user.id,new Date().toISOString());audit(user.id,'records_saved',records.length);db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}
+        const insert=db.prepare('INSERT INTO attendance(date,student_code,grade,division,status,updated_by,updated_at,reason) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(date,student_code) DO UPDATE SET grade=excluded.grade,division=excluded.division,status=excluded.status,updated_by=excluded.updated_by,updated_at=excluded.updated_at,reason=excluded.reason');
+        db.exec('BEGIN IMMEDIATE');try{for(const r of records){insert.run(r.date,r.student_code,r.grade,r.division,r.status,user.id,new Date().toISOString(),r.reason||'');db.prepare('INSERT INTO roster(student_code,grade,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(student_code) DO UPDATE SET grade=excluded.grade,updated_by=excluded.updated_by,updated_at=excluded.updated_at WHERE ? >= (SELECT MAX(date) FROM attendance WHERE student_code=excluded.student_code)').run(r.student_code,r.grade,user.id,new Date().toISOString(),r.date);}audit(user.id,'records_saved',records.length);db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}
         return send(200,{saved:records.length});
       }
       if(path==='/api/records'&&req.method==='DELETE'){
         if(typeof body.date!=='string'||typeof body.student_code!=='string')return send(400,{error:'Specify the attendance date and student code.'});
         const result=db.prepare('DELETE FROM attendance WHERE date=? AND student_code=?').run(body.date,body.student_code);audit(user.id,'record_deleted',Number(result.changes));return send(200,{deleted:Number(result.changes)});
+      }
+      if(path==='/api/roster'&&req.method==='POST'){
+        if(!Array.isArray(body.students)||!body.students.length||body.students.length>10000)return send(400,{error:'Supply 1–10,000 coded roster students.'});
+        let students;try{students=body.students.map(r=>{if(!r||Object.keys(r).sort().join(',')!=='grade,student_code')throw Error('Roster accepts only student codes and grades.');validateRecord({date:'2026-01-01',student_code:r.student_code,grade:r.grade,division:divisionForGrade(r.grade),status:'present'});return r;});}catch(e){return send(400,{error:e.message});}
+        const seen=new Set();for(const r of students){if(seen.has(r.student_code))return send(400,{error:'Duplicate student codes in roster.'});seen.add(r.student_code);}
+        const statement=db.prepare('INSERT INTO roster(student_code,grade,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(student_code) DO UPDATE SET grade=excluded.grade,updated_by=excluded.updated_by,updated_at=excluded.updated_at');
+        db.exec('BEGIN IMMEDIATE');try{for(const r of students)statement.run(r.student_code,r.grade,user.id,new Date().toISOString());audit(user.id,'roster_saved',students.length);db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}return send(200,{saved:students.length});
+      }
+      if(path==='/api/totals'&&req.method==='POST'){
+        let t;try{if(Object.keys(body).some(k=>!['date','grade','total','absent','leave','late'].includes(k)))throw Error('Only grade attendance counts may be saved.');t=validateTotals(body);}catch(e){return send(400,{error:e.message});}
+        if(db.prepare('SELECT 1 FROM attendance WHERE date=? AND grade=?').get(t.date,t.grade))return send(409,{error:'Individual attendance is already recorded for this grade and date. Continue with the student register, or remove those entries before using counts.'});
+        db.prepare('INSERT INTO grade_totals VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(date,grade) DO UPDATE SET total=excluded.total,present=excluded.present,absent=excluded.absent,leave=excluded.leave,late=excluded.late,updated_by=excluded.updated_by,updated_at=excluded.updated_at').run(t.date,t.grade,t.total,t.present,t.absent,t.leave,t.late,user.id,new Date().toISOString());audit(user.id,'grade_totals_saved',t.total);return send(200,{ok:true});
+      }
+      if(path==='/api/totals'&&req.method==='DELETE'){
+        if(typeof body.date!=='string'||typeof body.grade!=='string')return send(400,{error:'Select a date and grade.'});const result=db.prepare('DELETE FROM grade_totals WHERE date=? AND grade=?').run(body.date,body.grade);audit(user.id,'grade_totals_deleted',Number(result.changes));return send(200,{deleted:Number(result.changes)});
       }
       if(path==='/api/users'&&req.method==='GET'){if(user.role!=='admin')return send(403,{error:'Administrator access required.'});return send(200,{users:db.prepare('SELECT id,username,role FROM users ORDER BY username').all()});}
       if(path==='/api/users'&&req.method==='POST'){
